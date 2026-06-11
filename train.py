@@ -7,7 +7,7 @@ from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
@@ -195,7 +195,7 @@ def run_epoch(
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(train):
-            with autocast(enabled=device.type == "cuda"):
+            with autocast(device_type=device.type, enabled=device.type == "cuda"):
                 outputs = model.forward_train(us, mr, preop_mr=preop_mr)
                 losses = criterion(
                     us_pred_noise=outputs["us"]["pred_noise"],
@@ -241,7 +241,7 @@ def main() -> None:
     ).to(device)
     criterion = DDICLoss(lambda_corr=args.lambda_corr, sigma_data=args.sigma_data).to(device)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler = GradScaler(enabled=device.type == "cuda")
+    scaler = GradScaler(device)
 
     start_epoch = 1
     best_val = float("inf")

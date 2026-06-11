@@ -165,22 +165,25 @@ class RemindSliceDataset(Dataset):
         us_slice: torch.Tensor,
         mr_slice: torch.Tensor,
         overlap_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        preop_mr_slice: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if not self.augment:
-            return us_slice, mr_slice, overlap_mask
+            return us_slice, mr_slice, overlap_mask, preop_mr_slice
 
         if self.rng.random() < 0.5:
             us_slice = torch.flip(us_slice, dims=[2])
             mr_slice = torch.flip(mr_slice, dims=[2])
             overlap_mask = torch.flip(overlap_mask, dims=[2])
+            preop_mr_slice = torch.flip(preop_mr_slice, dims=[2])
 
         if self.rng.random() < 0.2:
             angle = self.rng.uniform(-15.0, 15.0)
             us_slice, mr_slice = apply_rotation(us_slice, mr_slice, angle)
+            preop_mr_slice, _ = apply_rotation(preop_mr_slice, preop_mr_slice, angle)
             overlap_mask, _ = apply_rotation(overlap_mask, overlap_mask, angle)
             overlap_mask = (overlap_mask > 0.5).float()
 
-        return us_slice, mr_slice, overlap_mask
+        return us_slice, mr_slice, overlap_mask, preop_mr_slice
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         case_idx, slice_idx = self._sample_case_and_index(index)
@@ -203,7 +206,7 @@ class RemindSliceDataset(Dataset):
         overlap_mask = resize_tensor(overlap_mask, self.image_size)
         preop_mr_slice = resize_tensor(preop_mr_slice, self.image_size)
         overlap_mask = (overlap_mask > 0.5).float()
-        us_slice, mr_slice, overlap_mask = self._augment(us_slice, mr_slice, overlap_mask)
+        us_slice, mr_slice, overlap_mask, preop_mr_slice = self._augment(us_slice, mr_slice, overlap_mask, preop_mr_slice)
 
         return {
             "subject_id": self.cases[case_idx]["subject_id"],

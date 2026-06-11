@@ -53,11 +53,11 @@ class EDMPreconditioning(nn.Module):
 
     # ---- denoise: network output → x0 prediction ----
 
-    def denoise(self, F_theta: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+    def denoise(self, x_sigma: torch.Tensor, F_theta: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
         """Apply preconditioning to recover x0 from raw network output F_theta."""
         c_skip = self.c_skip(sigma).view(-1, *([1] * (F_theta.ndim - 1)))
         c_out = self.c_out(sigma).view(-1, *([1] * (F_theta.ndim - 1)))
-        return c_skip * F_theta + c_out * F_theta
+        return c_skip * x_sigma + c_out * F_theta
 
     # ---- sample σ for training (log-normal) ----
 
@@ -369,7 +369,7 @@ class EDMUS(nn.Module):
         )
 
     def encode_condition(self, us: torch.Tensor) -> List[torch.Tensor]:
-        sigma = torch.zeros(us.size(0), device=us.device)
+        sigma = torch.full((us.size(0),), self.edm.sigma_min, device=us.device)
         _, encoder_features, _ = self.unet.encode(us, sigma)
         return encoder_features
 
@@ -395,15 +395,11 @@ class EDMUS(nn.Module):
         c_out = self.edm.c_out(sigma).view(-1, *([1] * (us.ndim - 1)))
         x0_hat = (c_skip * x_sigma + c_out * F_theta).clamp(-1.0, 1.0)
 
-        # Target: the raw network should predict the noise (Denoiser score matching)
-        # EDM target: F_theta should approximate c_skip*x + c_out*noise → we use
-        # the standard EDM loss: ||F_theta - target||^2 where target = (x - c_skip*x_sigma)/c_out
-        # Simplified: the loss is on the raw network output vs. the "score" target
-        # In practice, EDM uses: loss = (F_theta - target)^2 weighted by (sigma^2 + sigma_data^2) / (sigma^2 * sigma_data^2)
-        # We follow Karras: target = (noise) and weight by (sigma^2 + sigma_data^2) / (sigma * sigma_data)^2
-        # But for simplicity and consistency with DDIC, we use the denoised x0 for correlation loss
-        # and MSE on raw network output vs. noise target
-        target = noise
+        # EDM target: F_theta should predict (x - c_skip * x_sigma) / c_out
+        # This is the effective denoising target under EDM preconditioning.
+        # With c_skip * x_sigma + c_out * F_theta ≈ x0, solving for F_theta gives:
+        #   F_theta ≈ (x0 - c_skip * x_sigma) / c_out
+        target = (us - c_skip * x_sigma) / (c_out + 1e-8)
 
         return {
             "x_sigma": x_sigma,
@@ -477,7 +473,8 @@ class EDMMR(nn.Module):
         c_out = self.edm.c_out(sigma).view(-1, *([1] * (mr.ndim - 1)))
         x0_hat = (c_skip * x_sigma + c_out * F_theta).clamp(-1.0, 1.0)
 
-        target = noise
+        # EDM target: F_theta should predict (x0 - c_skip * x_sigma) / c_out
+        target = (mr - c_skip * x_sigma) / (c_out + 1e-8)
 
         return {
             "x_sigma": x_sigma,

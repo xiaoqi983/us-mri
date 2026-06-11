@@ -88,7 +88,7 @@ def rigid_register(fixed: sitk.Image, moving: sitk.Image) -> sitk.Transform:
     )
 
     registration = sitk.ImageRegistrationMethod()
-    registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
+    registration.SetMetricAsMattesMutualInformation(50)
     registration.SetMetricSamplingStrategy(registration.RANDOM)
     registration.SetMetricSamplingPercentage(0.1, seed=42)
     registration.SetInterpolator(sitk.sitkLinear)
