@@ -8,11 +8,11 @@ import numpy as np
 import torch
 
 from dataset import resize_tensor
-from model import DualDDPMCorrelationModel
+from model import DualEDMCorrelationModel
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Sample T2w MRI from 2.5D ioUS condition using trained DDIC.")
+    parser = argparse.ArgumentParser(description="Sample MR from US condition using trained Dual EDM + Correlation model.")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained checkpoint.")
     parser.add_argument("--output-dir", type=str, default="./samples")
     parser.add_argument("--preprocessed-root", type=str, default=None, help="Root directory containing case folders.")
@@ -22,9 +22,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preop-mr-path", type=str, default=None, help="Path to preprocessed preop_mr.npy for structural prior.")
     parser.add_argument("--slice-index", type=int, required=True, help="Center slice index i used for [i-1, i, i+1].")
     parser.add_argument("--image-size", type=int, default=256)
-    parser.add_argument("--sampling", type=str, default="ddim", choices=["ddpm", "ddim"])
-    parser.add_argument("--ddim-steps", type=int, default=100)
-    parser.add_argument("--eta", type=float, default=0.0)
+    parser.add_argument("--num-steps", type=int, default=18, help="Number of EDM sampling steps (default: 18).")
+    parser.add_argument("--s-churn", type=float, default=40.0, help="Stochastic churn parameter (0 = deterministic).")
+    parser.add_argument("--s-tmin", type=float, default=0.05, help="Minimum σ for stochastic noise injection.")
+    parser.add_argument("--s-tmax", type=float, default=50.0, help="Maximum σ for stochastic noise injection.")
+    parser.add_argument("--s-noise", type=float, default=1.003, help="Stochastic noise injection scale.")
     parser.add_argument("--device", type=str, default=None, help="cuda / cpu. Defaults to auto.")
     return parser.parse_args()
 
@@ -90,13 +92,15 @@ def load_preop_mr_slice(preop_mr_path: Optional[Path], slice_index: int, image_s
     return preop_mr_slice
 
 
-def build_model_from_checkpoint(checkpoint: dict, device: torch.device) -> DualDDPMCorrelationModel:
+def build_model_from_checkpoint(checkpoint: dict, device: torch.device) -> DualEDMCorrelationModel:
     model_config = checkpoint.get("model_config", {})
-    model = DualDDPMCorrelationModel(
-        timesteps=int(model_config.get("timesteps", 1000)),
+    model = DualEDMCorrelationModel(
         base_channels=int(model_config.get("base_channels", 64)),
         channel_mults=tuple(model_config.get("channel_mults", [1, 2, 4, 8])),
         num_res_blocks=int(model_config.get("num_res_blocks", 2)),
+        sigma_data=float(model_config.get("sigma_data", 0.5)),
+        sigma_min=float(model_config.get("sigma_min", 0.002)),
+        sigma_max=float(model_config.get("sigma_max", 80.0)),
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
@@ -124,9 +128,11 @@ def main() -> None:
     with torch.no_grad():
         generated = model.sample(
             us=us_input,
-            sampling=args.sampling,
-            ddim_steps=args.ddim_steps,
-            eta=args.eta,
+            num_steps=args.num_steps,
+            s_churn=args.s_churn,
+            s_tmin=args.s_tmin,
+            s_tmax=args.s_tmax,
+            s_noise=args.s_noise,
             preop_mr=preop_mr_input,
         )
 
@@ -145,9 +151,11 @@ def main() -> None:
             {
                 "subject_id": subject_id,
                 "slice_index": slice_index,
-                "sampling": args.sampling,
-                "ddim_steps": args.ddim_steps,
-                "eta": args.eta,
+                "num_steps": args.num_steps,
+                "s_churn": args.s_churn,
+                "s_tmin": args.s_tmin,
+                "s_tmax": args.s_tmax,
+                "s_noise": args.s_noise,
                 "checkpoint": str(Path(args.checkpoint).resolve()),
                 "us_path": str(us_path),
                 "mr_path": str(mr_path) if mr_path is not None else None,

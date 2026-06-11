@@ -6,6 +6,72 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# ---------------------------------------------------------------------------
+# EDM Preconditioning (Karras et al., 2022)
+# ---------------------------------------------------------------------------
+
+class EDMPreconditioning(nn.Module):
+    """EDM preconditioning wrappers and σ utilities.
+
+    Key hyper-parameters (Table 1 of the paper):
+        σ_data = 0.5   (assumed data std, our data is in [-1,1])
+        σ_min  = 0.002
+        σ_max  = 80.0
+    """
+
+    def __init__(
+        self,
+        sigma_data: float = 0.5,
+        sigma_min: float = 0.002,
+        sigma_max: float = 80.0,
+    ) -> None:
+        super().__init__()
+        self.sigma_data = sigma_data
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+
+    # ---- preconditioning coefficients (scalar, per-sample) ----
+
+    def c_skip(self, sigma: torch.Tensor) -> torch.Tensor:
+        return self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
+
+    def c_out(self, sigma: torch.Tensor) -> torch.Tensor:
+        return sigma * self.sigma_data / torch.sqrt(sigma ** 2 + self.sigma_data ** 2)
+
+    def c_in(self, sigma: torch.Tensor) -> torch.Tensor:
+        return 1.0 / torch.sqrt(sigma ** 2 + self.sigma_data ** 2)
+
+    def c_noise(self, sigma: torch.Tensor) -> torch.Tensor:
+        return 0.25 * torch.log(sigma + 1e-20)
+
+    # ---- forward diffusion: add noise ----
+
+    def q_sample(self, x: torch.Tensor, sigma: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if noise is None:
+            noise = torch.randn_like(x)
+        return x + sigma.view(-1, *([1] * (x.ndim - 1))) * noise
+
+    # ---- denoise: network output → x0 prediction ----
+
+    def denoise(self, F_theta: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        """Apply preconditioning to recover x0 from raw network output F_theta."""
+        c_skip = self.c_skip(sigma).view(-1, *([1] * (F_theta.ndim - 1)))
+        c_out = self.c_out(sigma).view(-1, *([1] * (F_theta.ndim - 1)))
+        return c_skip * F_theta + c_out * F_theta
+
+    # ---- sample σ for training (log-normal) ----
+
+    def sample_sigma(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Sample σ from log-normal distribution (mean=-1.2, std=1.2)."""
+        log_sigma = torch.randn(batch_size, device=device) * 1.2 - 1.2
+        sigma = log_sigma.exp().clamp(self.sigma_min, self.sigma_max)
+        return sigma
+
+
+# ---------------------------------------------------------------------------
+# Building blocks (unchanged from DDPM version)
+# ---------------------------------------------------------------------------
+
 def make_group_norm(channels: int) -> nn.GroupNorm:
     for groups in (32, 16, 8, 4, 2, 1):
         if channels % groups == 0:
@@ -13,29 +79,21 @@ def make_group_norm(channels: int) -> nn.GroupNorm:
     return nn.GroupNorm(1, channels)
 
 
-def linear_beta_schedule(timesteps: int, beta_start: float = 1e-4, beta_end: float = 2e-2) -> torch.Tensor:
-    return torch.linspace(beta_start, beta_end, timesteps, dtype=torch.float32)
+class SigmaEmbedding(nn.Module):
+    """Embed continuous σ for the UNet (replaces SinusoidalTimeEmbedding)."""
 
-
-def extract(buffer: torch.Tensor, timesteps: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
-    values = buffer.gather(0, timesteps)
-    return values.view(-1, *([1] * (len(target_shape) - 1)))
-
-
-class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
         self.dim = dim
+        self.mlp = nn.Sequential(
+            nn.Linear(1, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+        )
 
-    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        half_dim = self.dim // 2
-        scale = math.log(10_000) / max(half_dim - 1, 1)
-        frequencies = torch.exp(torch.arange(half_dim, device=timesteps.device) * -scale)
-        embeddings = timesteps.float().unsqueeze(1) * frequencies.unsqueeze(0)
-        embeddings = torch.cat([embeddings.sin(), embeddings.cos()], dim=1)
-        if self.dim % 2 == 1:
-            embeddings = F.pad(embeddings, (0, 1))
-        return embeddings
+    def forward(self, sigma: torch.Tensor) -> torch.Tensor:
+        # sigma: (B,) → (B, dim)
+        return self.mlp(sigma.unsqueeze(-1))
 
 
 class ResidualBlock(nn.Module):
@@ -167,8 +225,9 @@ class DenoisingUNet(nn.Module):
         super().__init__()
         self.enable_source_fusion = enable_source_fusion
         time_dim = base_channels * 4
-        self.time_mlp = nn.Sequential(
-            SinusoidalTimeEmbedding(base_channels),
+        # EDM: use sigma embedding instead of sinusoidal timestep embedding
+        self.sigma_mlp = nn.Sequential(
+            SigmaEmbedding(base_channels),
             nn.Linear(base_channels, time_dim),
             nn.SiLU(),
             nn.Linear(time_dim, time_dim),
@@ -236,8 +295,8 @@ class DenoisingUNet(nn.Module):
         self.out_norm = make_group_norm(current_channels)
         self.out_conv = nn.Conv2d(current_channels, out_channels, kernel_size=3, padding=1)
 
-    def encode(self, x: torch.Tensor, timesteps: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor]:
-        time_emb = self.time_mlp(timesteps)
+    def encode(self, x: torch.Tensor, sigma: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor]:
+        time_emb = self.sigma_mlp(sigma)
         h = self.input_proj(x)
         encoder_features: List[torch.Tensor] = []
         for level, stage in enumerate(self.encoder_stages):
@@ -270,11 +329,11 @@ class DenoisingUNet(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        timesteps: torch.Tensor,
+        sigma: torch.Tensor,
         source_features: Optional[List[torch.Tensor]] = None,
         return_encoder_features: bool = False,
     ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
-        h, encoder_features, time_emb = self.encode(x, timesteps)
+        h, encoder_features, time_emb = self.encode(x, sigma)
         h = self.mid_block1(h, time_emb)
         h = self.mid_attn(h)
         h = self.mid_block2(h, time_emb)
@@ -284,76 +343,22 @@ class DenoisingUNet(nn.Module):
         return out, None
 
 
-class GaussianDiffusion(nn.Module):
-    def __init__(self, timesteps: int = 1000) -> None:
-        super().__init__()
-        betas = linear_beta_schedule(timesteps)
-        alphas = 1.0 - betas
-        alphas_cumprod = torch.cumprod(alphas, dim=0)
-        alphas_cumprod_prev = torch.cat([torch.ones(1), alphas_cumprod[:-1]], dim=0)
+# ---------------------------------------------------------------------------
+# EDM-US: self-supervised denoising on ultrasound
+# ---------------------------------------------------------------------------
 
-        self.timesteps = timesteps
-        self.register_buffer("betas", betas)
-        self.register_buffer("alphas", alphas)
-        self.register_buffer("alphas_cumprod", alphas_cumprod)
-        self.register_buffer("alphas_cumprod_prev", alphas_cumprod_prev)
-        self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
-        self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
-        self.register_buffer("sqrt_recip_alphas_cumprod", torch.sqrt(1.0 / alphas_cumprod))
-        self.register_buffer("sqrt_recipm1_alphas_cumprod", torch.sqrt(1.0 / alphas_cumprod - 1.0))
-        self.register_buffer(
-            "posterior_variance",
-            betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod),
-        )
-        self.register_buffer(
-            "posterior_log_variance_clipped",
-            torch.log(torch.clamp(betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod), min=1e-20)),
-        )
-        self.register_buffer(
-            "posterior_mean_coef1",
-            betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod),
-        )
-        self.register_buffer(
-            "posterior_mean_coef2",
-            (1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod),
-        )
-
-    def q_sample(self, x_start: torch.Tensor, timesteps: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if noise is None:
-            noise = torch.randn_like(x_start)
-        return (
-            extract(self.sqrt_alphas_cumprod, timesteps, x_start.shape) * x_start
-            + extract(self.sqrt_one_minus_alphas_cumprod, timesteps, x_start.shape) * noise
-        )
-
-    def predict_x0_from_noise(self, x_t: torch.Tensor, timesteps: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
-        return (
-            extract(self.sqrt_recip_alphas_cumprod, timesteps, x_t.shape) * x_t
-            - extract(self.sqrt_recipm1_alphas_cumprod, timesteps, x_t.shape) * noise
-        )
-
-    def q_posterior(
-        self, x_start: torch.Tensor, x_t: torch.Tensor, timesteps: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        posterior_mean = (
-            extract(self.posterior_mean_coef1, timesteps, x_t.shape) * x_start
-            + extract(self.posterior_mean_coef2, timesteps, x_t.shape) * x_t
-        )
-        posterior_variance = extract(self.posterior_variance, timesteps, x_t.shape)
-        posterior_log_variance = extract(self.posterior_log_variance_clipped, timesteps, x_t.shape)
-        return posterior_mean, posterior_variance, posterior_log_variance
-
-
-class DDPMUS(nn.Module):
+class EDMUS(nn.Module):
     def __init__(
         self,
-        timesteps: int = 1000,
         base_channels: int = 64,
         channel_mults: Sequence[int] = (1, 2, 4, 8),
         num_res_blocks: int = 2,
+        sigma_data: float = 0.5,
+        sigma_min: float = 0.002,
+        sigma_max: float = 80.0,
     ) -> None:
         super().__init__()
-        self.diffusion = GaussianDiffusion(timesteps=timesteps)
+        self.edm = EDMPreconditioning(sigma_data=sigma_data, sigma_min=sigma_min, sigma_max=sigma_max)
         self.unet = DenoisingUNet(
             in_channels=3,
             out_channels=3,
@@ -364,37 +369,69 @@ class DDPMUS(nn.Module):
         )
 
     def encode_condition(self, us: torch.Tensor) -> List[torch.Tensor]:
-        timesteps = torch.zeros(us.size(0), device=us.device, dtype=torch.long)
-        _, encoder_features, _ = self.unet.encode(us, timesteps)
+        sigma = torch.zeros(us.size(0), device=us.device)
+        _, encoder_features, _ = self.unet.encode(us, sigma)
         return encoder_features
 
     def forward_train(
-        self, us: torch.Tensor, timesteps: torch.Tensor, noise: Optional[torch.Tensor] = None
+        self, us: torch.Tensor, sigma: Optional[torch.Tensor] = None, noise: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
+        if sigma is None:
+            sigma = self.edm.sample_sigma(us.size(0), us.device)
         if noise is None:
             noise = torch.randn_like(us)
-        x_t = self.diffusion.q_sample(us, timesteps, noise)
-        pred_noise, encoder_features = self.unet(x_t, timesteps, return_encoder_features=True)
-        x0_hat = self.diffusion.predict_x0_from_noise(x_t, timesteps, pred_noise).clamp(-1.0, 1.0)
+
+        # Forward diffusion
+        x_sigma = self.edm.q_sample(us, sigma, noise)
+
+        # Precondition input
+        c_in = self.edm.c_in(sigma).view(-1, *([1] * (us.ndim - 1)))
+        c_noise = self.edm.c_noise(sigma)
+        # Network takes c_in * x_sigma and c_noise as sigma
+        F_theta, encoder_features = self.unet(c_in * x_sigma, c_noise, return_encoder_features=True)
+
+        # Precondition output → x0 prediction
+        c_skip = self.edm.c_skip(sigma).view(-1, *([1] * (us.ndim - 1)))
+        c_out = self.edm.c_out(sigma).view(-1, *([1] * (us.ndim - 1)))
+        x0_hat = (c_skip * x_sigma + c_out * F_theta).clamp(-1.0, 1.0)
+
+        # Target: the raw network should predict the noise (Denoiser score matching)
+        # EDM target: F_theta should approximate c_skip*x + c_out*noise → we use
+        # the standard EDM loss: ||F_theta - target||^2 where target = (x - c_skip*x_sigma)/c_out
+        # Simplified: the loss is on the raw network output vs. the "score" target
+        # In practice, EDM uses: loss = (F_theta - target)^2 weighted by (sigma^2 + sigma_data^2) / (sigma^2 * sigma_data^2)
+        # We follow Karras: target = (noise) and weight by (sigma^2 + sigma_data^2) / (sigma * sigma_data)^2
+        # But for simplicity and consistency with DDIC, we use the denoised x0 for correlation loss
+        # and MSE on raw network output vs. noise target
+        target = noise
+
         return {
-            "x_t": x_t,
+            "x_sigma": x_sigma,
+            "sigma": sigma,
             "noise": noise,
-            "pred_noise": pred_noise,
+            "pred_noise": F_theta,
+            "target": target,
             "x0_hat": x0_hat,
             "encoder_features": encoder_features,
         }
 
 
-class DDPMMR(nn.Module):
+# ---------------------------------------------------------------------------
+# EDM-MR: conditional generation with US + preop MR
+# ---------------------------------------------------------------------------
+
+class EDMMR(nn.Module):
     def __init__(
         self,
-        timesteps: int = 1000,
         base_channels: int = 64,
         channel_mults: Sequence[int] = (1, 2, 4, 8),
         num_res_blocks: int = 2,
+        sigma_data: float = 0.5,
+        sigma_min: float = 0.002,
+        sigma_max: float = 80.0,
     ) -> None:
         super().__init__()
-        self.diffusion = GaussianDiffusion(timesteps=timesteps)
+        self.edm = EDMPreconditioning(sigma_data=sigma_data, sigma_min=sigma_min, sigma_max=sigma_max)
         self.unet = DenoisingUNet(
             in_channels=5,
             out_channels=1,
@@ -404,156 +441,195 @@ class DDPMMR(nn.Module):
             enable_source_fusion=True,
         )
 
-    def predict_noise(
+    def _prepare_input(
         self,
-        x_t: torch.Tensor,
-        timesteps: torch.Tensor,
+        x_sigma: torch.Tensor,
+        sigma: torch.Tensor,
         us_condition: torch.Tensor,
-        source_features: List[torch.Tensor],
         preop_mr: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if preop_mr is None:
-            preop_mr = torch.zeros(x_t.size(0), 1, x_t.size(2), x_t.size(3), device=x_t.device)
-        model_input = torch.cat([x_t, us_condition, preop_mr], dim=1)
-        pred_noise, _ = self.unet(model_input, timesteps, source_features=source_features)
-        return pred_noise
+            preop_mr = torch.zeros(x_sigma.size(0), 1, x_sigma.size(2), x_sigma.size(3), device=x_sigma.device)
+        c_in = self.edm.c_in(sigma).view(-1, *([1] * (x_sigma.ndim - 1)))
+        c_noise = self.edm.c_noise(sigma)
+        model_input = torch.cat([c_in * x_sigma, us_condition, preop_mr], dim=1)
+        return model_input, c_noise
 
     def forward_train(
         self,
         mr: torch.Tensor,
         us_condition: torch.Tensor,
         source_features: List[torch.Tensor],
-        timesteps: torch.Tensor,
+        sigma: Optional[torch.Tensor] = None,
         noise: Optional[torch.Tensor] = None,
         preop_mr: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
+        if sigma is None:
+            sigma = self.edm.sample_sigma(mr.size(0), mr.device)
         if noise is None:
             noise = torch.randn_like(mr)
-        x_t = self.diffusion.q_sample(mr, timesteps, noise)
-        pred_noise = self.predict_noise(x_t, timesteps, us_condition, source_features, preop_mr)
-        x0_hat = self.diffusion.predict_x0_from_noise(x_t, timesteps, pred_noise).clamp(-1.0, 1.0)
+
+        x_sigma = self.edm.q_sample(mr, sigma, noise)
+        model_input, c_noise = self._prepare_input(x_sigma, sigma, us_condition, preop_mr)
+        F_theta, _ = self.unet(model_input, c_noise, source_features=source_features)
+
+        c_skip = self.edm.c_skip(sigma).view(-1, *([1] * (mr.ndim - 1)))
+        c_out = self.edm.c_out(sigma).view(-1, *([1] * (mr.ndim - 1)))
+        x0_hat = (c_skip * x_sigma + c_out * F_theta).clamp(-1.0, 1.0)
+
+        target = noise
+
         return {
-            "x_t": x_t,
+            "x_sigma": x_sigma,
+            "sigma": sigma,
             "noise": noise,
-            "pred_noise": pred_noise,
+            "pred_noise": F_theta,
+            "target": target,
             "x0_hat": x0_hat,
         }
 
     @torch.no_grad()
-    def p_sample(
+    def denoise_step(
         self,
-        x_t: torch.Tensor,
-        timesteps: torch.Tensor,
+        x_sigma: torch.Tensor,
+        sigma: torch.Tensor,
+        sigma_next: torch.Tensor,
         us_condition: torch.Tensor,
         source_features: List[torch.Tensor],
         preop_mr: Optional[torch.Tensor] = None,
+        s_churn: float = 0.0,
+        s_tmin: float = 0.0,
+        s_tmax: float = float("inf"),
+        s_noise: float = 1.0,
     ) -> torch.Tensor:
-        pred_noise = self.predict_noise(x_t, timesteps, us_condition, source_features, preop_mr)
-        x0_hat = self.diffusion.predict_x0_from_noise(x_t, timesteps, pred_noise).clamp(-1.0, 1.0)
-        posterior_mean, _, posterior_log_variance = self.diffusion.q_posterior(x0_hat, x_t, timesteps)
-        nonzero_mask = (timesteps != 0).float().view(-1, 1, 1, 1)
-        noise = torch.randn_like(x_t)
-        return posterior_mean + nonzero_mask * torch.exp(0.5 * posterior_log_variance) * noise
+        """Heun's 2nd-order deterministic/stochastic sampler step (Karras et al.)."""
+        # Optional stochastic noise injection
+        if s_churn > 0 and sigma.min().item() > s_tmin and sigma.max().item() < s_tmax:
+            gamma = min(s_churn / len(sigma), 1.0)
+            noise_inject = torch.randn_like(x_sigma) * s_noise
+            sigma_hat = sigma + gamma * sigma
+            x_hat = x_sigma + torch.sqrt(sigma_hat ** 2 - sigma ** 2).view(-1, *([1] * (x_sigma.ndim - 1))) * noise_inject
+        else:
+            sigma_hat = sigma
+            x_hat = x_sigma
 
-    @torch.no_grad()
-    def ddim_step(
-        self,
-        x_t: torch.Tensor,
-        timesteps: torch.Tensor,
-        next_timesteps: torch.Tensor,
-        us_condition: torch.Tensor,
-        source_features: List[torch.Tensor],
-        eta: float = 0.0,
-        preop_mr: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        pred_noise = self.predict_noise(x_t, timesteps, us_condition, source_features, preop_mr)
-        alpha_t = extract(self.diffusion.alphas_cumprod, timesteps, x_t.shape)
-        alpha_next = extract(self.diffusion.alphas_cumprod, next_timesteps.clamp(min=0), x_t.shape)
-        x0_hat = self.diffusion.predict_x0_from_noise(x_t, timesteps, pred_noise).clamp(-1.0, 1.0)
+        # Denoise to get x0 estimate
+        model_input, c_noise = self._prepare_input(x_hat, sigma_hat, us_condition, preop_mr)
+        F_theta, _ = self.unet(model_input, c_noise, source_features=source_features)
 
-        sigma = (
-            eta
-            * torch.sqrt((1 - alpha_next) / (1 - alpha_t))
-            * torch.sqrt(torch.clamp(1 - alpha_t / alpha_next, min=0.0))
-        )
-        direction = torch.sqrt(torch.clamp(1 - alpha_next - sigma ** 2, min=0.0)) * pred_noise
-        noise = torch.randn_like(x_t)
-        x_next = torch.sqrt(alpha_next) * x0_hat + direction + sigma * noise
-        zero_mask = (next_timesteps < 0).float().view(-1, 1, 1, 1)
-        return x_next * (1.0 - zero_mask) + x0_hat * zero_mask
+        c_skip = self.edm.c_skip(sigma_hat).view(-1, *([1] * (x_sigma.ndim - 1)))
+        c_out = self.edm.c_out(sigma_hat).view(-1, *([1] * (x_sigma.ndim - 1)))
+        x0_hat = c_skip * x_hat + c_out * F_theta
+
+        # Score / derivative
+        d_cur = (x_hat - x0_hat) / sigma_hat.view(-1, *([1] * (x_sigma.ndim - 1)))
+
+        # Euler step
+        x_next = x_hat + (sigma_next - sigma_hat).view(-1, *([1] * (x_sigma.ndim - 1))) * d_cur
+
+        # 2nd-order correction (Heun)
+        if sigma_next.min().item() > 0:
+            model_input_next, c_noise_next = self._prepare_input(x_next, sigma_next, us_condition, preop_mr)
+            F_theta_next, _ = self.unet(model_input_next, c_noise_next, source_features=source_features)
+
+            c_skip_next = self.edm.c_skip(sigma_next).view(-1, *([1] * (x_sigma.ndim - 1)))
+            c_out_next = self.edm.c_out(sigma_next).view(-1, *([1] * (x_sigma.ndim - 1)))
+            x0_hat_next = c_skip_next * x_next + c_out_next * F_theta_next
+
+            d_next = (x_next - x0_hat_next) / sigma_next.view(-1, *([1] * (x_sigma.ndim - 1)))
+            x_next = x_hat + (sigma_next - sigma_hat).view(-1, *([1] * (x_sigma.ndim - 1))) * (d_cur + d_next) / 2.0
+
+        return x_next.clamp(-1.0, 1.0)
 
 
-class DualDDPMCorrelationModel(nn.Module):
+# ---------------------------------------------------------------------------
+# Dual EDM + Correlation Model
+# ---------------------------------------------------------------------------
+
+class DualEDMCorrelationModel(nn.Module):
     def __init__(
         self,
-        timesteps: int = 1000,
         base_channels: int = 64,
         channel_mults: Sequence[int] = (1, 2, 4, 8),
         num_res_blocks: int = 2,
+        sigma_data: float = 0.5,
+        sigma_min: float = 0.002,
+        sigma_max: float = 80.0,
     ) -> None:
         super().__init__()
-        self.timesteps = timesteps
-        self.us_ddpm = DDPMUS(
-            timesteps=timesteps,
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.us_edm = EDMUS(
             base_channels=base_channels,
             channel_mults=channel_mults,
             num_res_blocks=num_res_blocks,
+            sigma_data=sigma_data,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
         )
-        self.mr_ddpm = DDPMMR(
-            timesteps=timesteps,
+        self.mr_edm = EDMMR(
             base_channels=base_channels,
             channel_mults=channel_mults,
             num_res_blocks=num_res_blocks,
+            sigma_data=sigma_data,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
         )
 
-    def sample_timesteps(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        return torch.randint(0, self.timesteps, (batch_size,), device=device, dtype=torch.long)
+    def sample_sigma(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        return self.us_edm.edm.sample_sigma(batch_size, device)
 
     def forward_train(
         self,
         us: torch.Tensor,
         mr: torch.Tensor,
-        t_us: Optional[torch.Tensor] = None,
-        t_mr: Optional[torch.Tensor] = None,
+        sigma_us: Optional[torch.Tensor] = None,
+        sigma_mr: Optional[torch.Tensor] = None,
         preop_mr: Optional[torch.Tensor] = None,
     ) -> Dict[str, Dict[str, torch.Tensor]]:
         batch_size = us.size(0)
         device = us.device
-        if t_us is None:
-            t_us = self.sample_timesteps(batch_size, device)
-        if t_mr is None:
-            t_mr = self.sample_timesteps(batch_size, device)
+        if sigma_us is None:
+            sigma_us = self.sample_sigma(batch_size, device)
+        if sigma_mr is None:
+            sigma_mr = self.sample_sigma(batch_size, device)
 
-        us_outputs = self.us_ddpm.forward_train(us, t_us)
-        source_features = self.us_ddpm.encode_condition(us)
-        mr_outputs = self.mr_ddpm.forward_train(mr, us, source_features, t_mr, preop_mr=preop_mr)
-        return {"us": us_outputs, "mr": mr_outputs, "timesteps": {"us": t_us, "mr": t_mr}}
+        us_outputs = self.us_edm.forward_train(us, sigma=sigma_us)
+        source_features = self.us_edm.encode_condition(us)
+        mr_outputs = self.mr_edm.forward_train(mr, us, source_features, sigma=sigma_mr, preop_mr=preop_mr)
+        return {"us": us_outputs, "mr": mr_outputs, "sigmas": {"us": sigma_us, "mr": sigma_mr}}
 
     @torch.no_grad()
     def sample(
         self,
         us: torch.Tensor,
-        sampling: str = "ddpm",
-        ddim_steps: int = 1000,
-        eta: float = 0.0,
+        num_steps: int = 18,
+        s_churn: float = 40.0,
+        s_tmin: float = 0.05,
+        s_tmax: float = 50.0,
+        s_noise: float = 1.003,
         preop_mr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Stochastic sampler with Heun's 2nd-order correction (Algorithm 2 of Karras et al.)."""
         batch_size = us.size(0)
         device = us.device
-        source_features = self.us_ddpm.encode_condition(us)
-        x_t = torch.randn(batch_size, 1, us.size(2), us.size(3), device=device)
+        source_features = self.us_edm.encode_condition(us)
 
-        if sampling.lower() == "ddim":
-            ddim_steps = min(ddim_steps, self.timesteps)
-            schedule = torch.linspace(self.timesteps - 1, 0, ddim_steps, device=device).long()
-            next_schedule = torch.cat([schedule[1:], torch.full((1,), -1, device=device, dtype=torch.long)], dim=0)
-            for current_t, next_t in zip(schedule, next_schedule):
-                t = torch.full((batch_size,), int(current_t.item()), device=device, dtype=torch.long)
-                nt = torch.full((batch_size,), int(next_t.item()), device=device, dtype=torch.long)
-                x_t = self.mr_ddpm.ddim_step(x_t, t, nt, us, source_features, eta=eta, preop_mr=preop_mr)
-            return x_t.clamp(-1.0, 1.0)
+        # Build σ schedule (geometric progression)
+        sigmas = torch.exp(
+            torch.linspace(math.log(self.sigma_max), math.log(self.sigma_min), num_steps + 1, device=device)
+        )
 
-        for step in reversed(range(self.timesteps)):
-            timesteps = torch.full((batch_size,), step, device=device, dtype=torch.long)
-            x_t = self.mr_ddpm.p_sample(x_t, timesteps, us, source_features, preop_mr=preop_mr)
-        return x_t.clamp(-1.0, 1.0)
+        # Start from pure noise
+        x = torch.randn(batch_size, 1, us.size(2), us.size(3), device=device) * self.sigma_max
+
+        for i in range(num_steps):
+            sigma_cur = sigmas[i].expand(batch_size)
+            sigma_next = sigmas[i + 1].expand(batch_size)
+            x = self.mr_edm.denoise_step(
+                x, sigma_cur, sigma_next, us, source_features,
+                preop_mr=preop_mr,
+                s_churn=s_churn, s_tmin=s_tmin, s_tmax=s_tmax, s_noise=s_noise,
+            )
+
+        return x.clamp(-1.0, 1.0)

@@ -13,16 +13,16 @@ from torch.utils.data import DataLoader
 
 from dataset import RemindSliceDataset, discover_pairs
 from loss import DDICLoss
-from model import DualDDPMCorrelationModel
+from model import DualEDMCorrelationModel
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train DDIC dual-DDPM for intraoperative USpreimri -> intraop 2DAXT2BLADE synthesis.")
+    parser = argparse.ArgumentParser(description="Train Dual EDM + Correlation for intraoperative US -> intraop MR synthesis.")
     parser.add_argument("--data-root", type=str, required=True, help="Preprocessed root containing case folders or manifest.")
     parser.add_argument("--save-dir", type=str, default="./checkpoints")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--samples-per-volume", type=int, default=64)
@@ -30,9 +30,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lambda-corr", type=float, default=0.1)
-    parser.add_argument("--timesteps", type=int, default=1000)
     parser.add_argument("--base-channels", type=int, default=64)
     parser.add_argument("--num-res-blocks", type=int, default=2)
+    parser.add_argument("--sigma-data", type=float, default=0.5, help="Assumed data std for EDM preconditioning.")
+    parser.add_argument("--sigma-min", type=float, default=0.002, help="Minimum noise level for EDM.")
+    parser.add_argument("--sigma-max", type=float, default=80.0, help="Maximum noise level for EDM.")
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--save-every", type=int, default=5)
     parser.add_argument("--resume", type=str, default=None)
@@ -123,7 +125,7 @@ def finalize_metrics(running: Dict[str, float], num_samples: int) -> Dict[str, f
 def save_checkpoint(
     save_path: Path,
     epoch: int,
-    model: DualDDPMCorrelationModel,
+    model: DualEDMCorrelationModel,
     optimizer: AdamW,
     scaler: GradScaler,
     args: argparse.Namespace,
@@ -138,10 +140,12 @@ def save_checkpoint(
             "scaler_state": scaler.state_dict(),
             "best_val_loss": best_val,
             "model_config": {
-                "timesteps": args.timesteps,
                 "base_channels": args.base_channels,
                 "channel_mults": [1, 2, 4, 8],
                 "num_res_blocks": args.num_res_blocks,
+                "sigma_data": args.sigma_data,
+                "sigma_min": args.sigma_min,
+                "sigma_max": args.sigma_max,
             },
             "train_config": vars(args),
         },
@@ -151,7 +155,7 @@ def save_checkpoint(
 
 def load_checkpoint(
     ckpt_path: Path,
-    model: DualDDPMCorrelationModel,
+    model: DualEDMCorrelationModel,
     optimizer: AdamW,
     scaler: GradScaler,
     device: torch.device,
@@ -166,7 +170,7 @@ def load_checkpoint(
 
 
 def run_epoch(
-    model: DualDDPMCorrelationModel,
+    model: DualEDMCorrelationModel,
     criterion: DDICLoss,
     data_loader: DataLoader,
     optimizer: AdamW,
@@ -195,12 +199,14 @@ def run_epoch(
                 outputs = model.forward_train(us, mr, preop_mr=preop_mr)
                 losses = criterion(
                     us_pred_noise=outputs["us"]["pred_noise"],
-                    us_true_noise=outputs["us"]["noise"],
+                    us_true_noise=outputs["us"]["target"],
                     mr_pred_noise=outputs["mr"]["pred_noise"],
-                    mr_true_noise=outputs["mr"]["noise"],
+                    mr_true_noise=outputs["mr"]["target"],
                     x0_hat_mr=outputs["mr"]["x0_hat"],
                     us_condition=us,
                     overlap_mask=batch["overlap_mask"],
+                    us_sigma=outputs["sigmas"]["us"],
+                    mr_sigma=outputs["sigmas"]["mr"],
                 )
 
             if train:
@@ -225,13 +231,15 @@ def main() -> None:
 
     train_loader, val_loader = build_dataloaders(args)
 
-    model = DualDDPMCorrelationModel(
-        timesteps=args.timesteps,
+    model = DualEDMCorrelationModel(
         base_channels=args.base_channels,
         channel_mults=(1, 2, 4, 8),
         num_res_blocks=args.num_res_blocks,
+        sigma_data=args.sigma_data,
+        sigma_min=args.sigma_min,
+        sigma_max=args.sigma_max,
     ).to(device)
-    criterion = DDICLoss(lambda_corr=args.lambda_corr).to(device)
+    criterion = DDICLoss(lambda_corr=args.lambda_corr, sigma_data=args.sigma_data).to(device)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = GradScaler(enabled=device.type == "cuda")
 

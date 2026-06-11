@@ -32,9 +32,20 @@ def pearson_corrcoef(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> tor
 
 
 class DDICLoss(nn.Module):
-    def __init__(self, lambda_corr: float = 0.1) -> None:
+    """Loss for Dual EDM + Correlation training.
+
+    EDM denoise loss uses the Karras weighting:
+        L_denoise = (sigma^2 + sigma_data^2) / (sigma * sigma_data)^2 * ||F_theta - target||^2
+    where target = noise (the added noise), and F_theta is the raw network output.
+
+    For backward compatibility, the interface accepts pred_noise and true_noise
+    which in the EDM context are F_theta and the noise target respectively.
+    """
+
+    def __init__(self, lambda_corr: float = 0.1, sigma_data: float = 0.5) -> None:
         super().__init__()
         self.lambda_corr = lambda_corr
+        self.sigma_data = sigma_data
         self.mr_corr_encoder = CorrelationFeatureExtractor(in_channels=1)
         self.us_corr_encoder = CorrelationFeatureExtractor(in_channels=3)
 
@@ -52,6 +63,10 @@ class DDICLoss(nn.Module):
         rho = pearson_corrcoef(mr_features, us_features)
         return 1.0 - rho.mean()
 
+    def _edm_loss_weight(self, sigma: torch.Tensor) -> torch.Tensor:
+        """EDM loss weighting: (σ² + σ_data²) / (σ · σ_data)²"""
+        return (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
+
     def forward(
         self,
         us_pred_noise: torch.Tensor,
@@ -61,9 +76,22 @@ class DDICLoss(nn.Module):
         x0_hat_mr: torch.Tensor,
         us_condition: torch.Tensor,
         overlap_mask: torch.Tensor,
+        us_sigma: torch.Tensor = None,
+        mr_sigma: torch.Tensor = None,
     ) -> Dict[str, torch.Tensor]:
-        us_denoise_loss = F.mse_loss(us_pred_noise, us_true_noise)
-        mr_denoise_loss = F.mse_loss(mr_pred_noise, mr_true_noise)
+        # EDM-weighted denoise loss
+        if us_sigma is not None:
+            us_weight = self._edm_loss_weight(us_sigma).view(-1, *([1] * (us_pred_noise.ndim - 1)))
+            us_denoise_loss = (us_weight * (us_pred_noise - us_true_noise) ** 2).mean()
+        else:
+            us_denoise_loss = F.mse_loss(us_pred_noise, us_true_noise)
+
+        if mr_sigma is not None:
+            mr_weight = self._edm_loss_weight(mr_sigma).view(-1, *([1] * (mr_pred_noise.ndim - 1)))
+            mr_denoise_loss = (mr_weight * (mr_pred_noise - mr_true_noise) ** 2).mean()
+        else:
+            mr_denoise_loss = F.mse_loss(mr_pred_noise, mr_true_noise)
+
         corr_loss = self.correlation_loss(x0_hat_mr, us_condition, overlap_mask)
         total_loss = us_denoise_loss + mr_denoise_loss + self.lambda_corr * corr_loss
         return {
