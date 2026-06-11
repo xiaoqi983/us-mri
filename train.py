@@ -241,7 +241,7 @@ def main() -> None:
     ).to(device)
     criterion = DDICLoss(lambda_corr=args.lambda_corr, sigma_data=args.sigma_data).to(device)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler = GradScaler(device)
+    scaler = GradScaler(device=device.type)
 
     start_epoch = 1
     best_val = float("inf")

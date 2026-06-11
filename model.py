@@ -49,7 +49,7 @@ class EDMPreconditioning(nn.Module):
     def q_sample(self, x: torch.Tensor, sigma: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
         if noise is None:
             noise = torch.randn_like(x)
-        return x + sigma.view(-1, *([1] * (x.ndim - 1))) * noise
+        return x + sigma.view(-1, 1, 1, 1) * noise
 
     # ---- denoise: network output → x0 prediction ----
 
@@ -385,14 +385,14 @@ class EDMUS(nn.Module):
         x_sigma = self.edm.q_sample(us, sigma, noise)
 
         # Precondition input
-        c_in = self.edm.c_in(sigma).view(-1, *([1] * (us.ndim - 1)))
+        c_in = self.edm.c_in(sigma).view(-1, 1, 1, 1)
         c_noise = self.edm.c_noise(sigma)
         # Network takes c_in * x_sigma and c_noise as sigma
         F_theta, encoder_features = self.unet(c_in * x_sigma, c_noise, return_encoder_features=True)
 
         # Precondition output → x0 prediction
-        c_skip = self.edm.c_skip(sigma).view(-1, *([1] * (us.ndim - 1)))
-        c_out = self.edm.c_out(sigma).view(-1, *([1] * (us.ndim - 1)))
+        c_skip = self.edm.c_skip(sigma).view(-1, 1, 1, 1)
+        c_out = self.edm.c_out(sigma).view(-1, 1, 1, 1)
         x0_hat = (c_skip * x_sigma + c_out * F_theta).clamp(-1.0, 1.0)
 
         # EDM target: F_theta should predict (x - c_skip * x_sigma) / c_out
@@ -446,7 +446,7 @@ class EDMMR(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if preop_mr is None:
             preop_mr = torch.zeros(x_sigma.size(0), 1, x_sigma.size(2), x_sigma.size(3), device=x_sigma.device)
-        c_in = self.edm.c_in(sigma).view(-1, *([1] * (x_sigma.ndim - 1)))
+        c_in = self.edm.c_in(sigma).view(-1, 1, 1, 1)
         c_noise = self.edm.c_noise(sigma)
         model_input = torch.cat([c_in * x_sigma, us_condition, preop_mr], dim=1)
         return model_input, c_noise
@@ -469,8 +469,8 @@ class EDMMR(nn.Module):
         model_input, c_noise = self._prepare_input(x_sigma, sigma, us_condition, preop_mr)
         F_theta, _ = self.unet(model_input, c_noise, source_features=source_features)
 
-        c_skip = self.edm.c_skip(sigma).view(-1, *([1] * (mr.ndim - 1)))
-        c_out = self.edm.c_out(sigma).view(-1, *([1] * (mr.ndim - 1)))
+        c_skip = self.edm.c_skip(sigma).view(-1, 1, 1, 1)
+        c_out = self.edm.c_out(sigma).view(-1, 1, 1, 1)
         x0_hat = (c_skip * x_sigma + c_out * F_theta).clamp(-1.0, 1.0)
 
         # EDM target: F_theta should predict (x0 - c_skip * x_sigma) / c_out
@@ -505,7 +505,7 @@ class EDMMR(nn.Module):
             gamma = min(s_churn / len(sigma), 1.0)
             noise_inject = torch.randn_like(x_sigma) * s_noise
             sigma_hat = sigma + gamma * sigma
-            x_hat = x_sigma + torch.sqrt(sigma_hat ** 2 - sigma ** 2).view(-1, *([1] * (x_sigma.ndim - 1))) * noise_inject
+            x_hat = x_sigma + torch.sqrt(sigma_hat ** 2 - sigma ** 2).view(-1, 1, 1, 1) * noise_inject
         else:
             sigma_hat = sigma
             x_hat = x_sigma
@@ -514,27 +514,27 @@ class EDMMR(nn.Module):
         model_input, c_noise = self._prepare_input(x_hat, sigma_hat, us_condition, preop_mr)
         F_theta, _ = self.unet(model_input, c_noise, source_features=source_features)
 
-        c_skip = self.edm.c_skip(sigma_hat).view(-1, *([1] * (x_sigma.ndim - 1)))
-        c_out = self.edm.c_out(sigma_hat).view(-1, *([1] * (x_sigma.ndim - 1)))
+        c_skip = self.edm.c_skip(sigma_hat).view(-1, 1, 1, 1)
+        c_out = self.edm.c_out(sigma_hat).view(-1, 1, 1, 1)
         x0_hat = c_skip * x_hat + c_out * F_theta
 
         # Score / derivative
-        d_cur = (x_hat - x0_hat) / sigma_hat.view(-1, *([1] * (x_sigma.ndim - 1)))
+        d_cur = (x_hat - x0_hat) / sigma_hat.view(-1, 1, 1, 1).clamp(min=1e-8)
 
         # Euler step
-        x_next = x_hat + (sigma_next - sigma_hat).view(-1, *([1] * (x_sigma.ndim - 1))) * d_cur
+        x_next = x_hat + (sigma_next - sigma_hat).view(-1, 1, 1, 1) * d_cur
 
         # 2nd-order correction (Heun)
         if sigma_next.min().item() > 0:
             model_input_next, c_noise_next = self._prepare_input(x_next, sigma_next, us_condition, preop_mr)
             F_theta_next, _ = self.unet(model_input_next, c_noise_next, source_features=source_features)
 
-            c_skip_next = self.edm.c_skip(sigma_next).view(-1, *([1] * (x_sigma.ndim - 1)))
-            c_out_next = self.edm.c_out(sigma_next).view(-1, *([1] * (x_sigma.ndim - 1)))
+            c_skip_next = self.edm.c_skip(sigma_next).view(-1, 1, 1, 1)
+            c_out_next = self.edm.c_out(sigma_next).view(-1, 1, 1, 1)
             x0_hat_next = c_skip_next * x_next + c_out_next * F_theta_next
 
-            d_next = (x_next - x0_hat_next) / sigma_next.view(-1, *([1] * (x_sigma.ndim - 1)))
-            x_next = x_hat + (sigma_next - sigma_hat).view(-1, *([1] * (x_sigma.ndim - 1))) * (d_cur + d_next) / 2.0
+            d_next = (x_next - x0_hat_next) / sigma_next.view(-1, 1, 1, 1).clamp(min=1e-8)
+            x_next = x_hat + (sigma_next - sigma_hat).view(-1, 1, 1, 1) * (d_cur + d_next) / 2.0
 
         return x_next.clamp(-1.0, 1.0)
 

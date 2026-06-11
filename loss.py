@@ -36,10 +36,7 @@ class DDICLoss(nn.Module):
 
     EDM denoise loss uses the Karras weighting:
         L_denoise = (sigma^2 + sigma_data^2) / (sigma * sigma_data)^2 * ||F_theta - target||^2
-    where target = noise (the added noise), and F_theta is the raw network output.
-
-    For backward compatibility, the interface accepts pred_noise and true_noise
-    which in the EDM context are F_theta and the noise target respectively.
+    where target = (x0 - c_skip * x_sigma) / c_out, and F_theta is the raw network output.
     """
 
     def __init__(self, lambda_corr: float = 0.1, sigma_data: float = 0.5) -> None:
