@@ -396,7 +396,7 @@ class DDPMMR(nn.Module):
         super().__init__()
         self.diffusion = GaussianDiffusion(timesteps=timesteps)
         self.unet = DenoisingUNet(
-            in_channels=4,
+            in_channels=5,
             out_channels=1,
             base_channels=base_channels,
             channel_mults=channel_mults,
@@ -410,8 +410,11 @@ class DDPMMR(nn.Module):
         timesteps: torch.Tensor,
         us_condition: torch.Tensor,
         source_features: List[torch.Tensor],
+        preop_mr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        model_input = torch.cat([x_t, us_condition], dim=1)
+        if preop_mr is None:
+            preop_mr = torch.zeros(x_t.size(0), 1, x_t.size(2), x_t.size(3), device=x_t.device)
+        model_input = torch.cat([x_t, us_condition, preop_mr], dim=1)
         pred_noise, _ = self.unet(model_input, timesteps, source_features=source_features)
         return pred_noise
 
@@ -422,11 +425,12 @@ class DDPMMR(nn.Module):
         source_features: List[torch.Tensor],
         timesteps: torch.Tensor,
         noise: Optional[torch.Tensor] = None,
+        preop_mr: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         if noise is None:
             noise = torch.randn_like(mr)
         x_t = self.diffusion.q_sample(mr, timesteps, noise)
-        pred_noise = self.predict_noise(x_t, timesteps, us_condition, source_features)
+        pred_noise = self.predict_noise(x_t, timesteps, us_condition, source_features, preop_mr)
         x0_hat = self.diffusion.predict_x0_from_noise(x_t, timesteps, pred_noise).clamp(-1.0, 1.0)
         return {
             "x_t": x_t,
@@ -442,8 +446,9 @@ class DDPMMR(nn.Module):
         timesteps: torch.Tensor,
         us_condition: torch.Tensor,
         source_features: List[torch.Tensor],
+        preop_mr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        pred_noise = self.predict_noise(x_t, timesteps, us_condition, source_features)
+        pred_noise = self.predict_noise(x_t, timesteps, us_condition, source_features, preop_mr)
         x0_hat = self.diffusion.predict_x0_from_noise(x_t, timesteps, pred_noise).clamp(-1.0, 1.0)
         posterior_mean, _, posterior_log_variance = self.diffusion.q_posterior(x0_hat, x_t, timesteps)
         nonzero_mask = (timesteps != 0).float().view(-1, 1, 1, 1)
@@ -459,8 +464,9 @@ class DDPMMR(nn.Module):
         us_condition: torch.Tensor,
         source_features: List[torch.Tensor],
         eta: float = 0.0,
+        preop_mr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        pred_noise = self.predict_noise(x_t, timesteps, us_condition, source_features)
+        pred_noise = self.predict_noise(x_t, timesteps, us_condition, source_features, preop_mr)
         alpha_t = extract(self.diffusion.alphas_cumprod, timesteps, x_t.shape)
         alpha_next = extract(self.diffusion.alphas_cumprod, next_timesteps.clamp(min=0), x_t.shape)
         x0_hat = self.diffusion.predict_x0_from_noise(x_t, timesteps, pred_noise).clamp(-1.0, 1.0)
@@ -509,6 +515,7 @@ class DualDDPMCorrelationModel(nn.Module):
         mr: torch.Tensor,
         t_us: Optional[torch.Tensor] = None,
         t_mr: Optional[torch.Tensor] = None,
+        preop_mr: Optional[torch.Tensor] = None,
     ) -> Dict[str, Dict[str, torch.Tensor]]:
         batch_size = us.size(0)
         device = us.device
@@ -519,7 +526,7 @@ class DualDDPMCorrelationModel(nn.Module):
 
         us_outputs = self.us_ddpm.forward_train(us, t_us)
         source_features = self.us_ddpm.encode_condition(us)
-        mr_outputs = self.mr_ddpm.forward_train(mr, us, source_features, t_mr)
+        mr_outputs = self.mr_ddpm.forward_train(mr, us, source_features, t_mr, preop_mr=preop_mr)
         return {"us": us_outputs, "mr": mr_outputs, "timesteps": {"us": t_us, "mr": t_mr}}
 
     @torch.no_grad()
@@ -529,6 +536,7 @@ class DualDDPMCorrelationModel(nn.Module):
         sampling: str = "ddpm",
         ddim_steps: int = 1000,
         eta: float = 0.0,
+        preop_mr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size = us.size(0)
         device = us.device
@@ -542,10 +550,10 @@ class DualDDPMCorrelationModel(nn.Module):
             for current_t, next_t in zip(schedule, next_schedule):
                 t = torch.full((batch_size,), int(current_t.item()), device=device, dtype=torch.long)
                 nt = torch.full((batch_size,), int(next_t.item()), device=device, dtype=torch.long)
-                x_t = self.mr_ddpm.ddim_step(x_t, t, nt, us, source_features, eta=eta)
+                x_t = self.mr_ddpm.ddim_step(x_t, t, nt, us, source_features, eta=eta, preop_mr=preop_mr)
             return x_t.clamp(-1.0, 1.0)
 
         for step in reversed(range(self.timesteps)):
             timesteps = torch.full((batch_size,), step, device=device, dtype=torch.long)
-            x_t = self.mr_ddpm.p_sample(x_t, timesteps, us, source_features)
+            x_t = self.mr_ddpm.p_sample(x_t, timesteps, us, source_features, preop_mr=preop_mr)
         return x_t.clamp(-1.0, 1.0)

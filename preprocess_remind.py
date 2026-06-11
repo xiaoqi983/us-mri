@@ -20,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--study-description", type=str, default="Intraop", help="Study description to match.")
     parser.add_argument("--us-series", type=str, default="USpreimri", help="Preferred ioUS series description.")
     parser.add_argument("--mr-series", type=str, default="2DAXT2BLADE", help="Preferred intraoperative MRI series.")
+    parser.add_argument("--preop-mr-series", type=str, default="3DAXT1postcontrast", help="Preoperative MRI series for structural prior.")
     parser.add_argument(
         "--spacing",
         type=float,
@@ -234,6 +235,7 @@ def collect_cases_from_metadata(
     study_description: str,
     us_series: str,
     mr_series: str,
+    preop_mr_series: str,
 ) -> List[Dict[str, str]]:
     grouped: Dict[str, Dict[str, Dict[str, str]]] = {}
     with open(metadata_csv, "r", encoding="utf-8-sig", newline="") as f:
@@ -244,9 +246,6 @@ def collect_cases_from_metadata(
                 continue
 
             study = row["Study Description"].strip().lower()
-            if study_description.lower() not in study:
-                continue
-
             modality = row["Modality"].strip().upper()
             desc = row["Series Description"].strip()
             path = resolve_dataset_path(dataset_root, row["File Location"])
@@ -254,25 +253,33 @@ def collect_cases_from_metadata(
                 continue
 
             bucket = grouped.setdefault(subject_id, {})
-            if modality == "US" and desc == us_series:
-                bucket["us"] = {"description": desc, "path": str(path)}
-            elif modality == "MR" and desc == mr_series:
-                bucket["mr"] = {"description": desc, "path": str(path)}
+
+            if study_description.lower() in study:
+                if modality == "US" and desc == us_series:
+                    bucket["us"] = {"description": desc, "path": str(path)}
+                elif modality == "MR" and desc == mr_series:
+                    bucket["mr"] = {"description": desc, "path": str(path)}
+
+            if study.lower() == "preop":
+                if modality == "MR" and desc == preop_mr_series:
+                    bucket["preop_mr"] = {"description": desc, "path": str(path)}
 
     cases: List[Dict[str, str]] = []
     for subject_id in sorted(grouped):
         bucket = grouped[subject_id]
         if "us" not in bucket or "mr" not in bucket:
             continue
-        cases.append(
-            {
-                "subject_id": subject_id,
-                "us_path": bucket["us"]["path"],
-                "mr_path": bucket["mr"]["path"],
-                "us_description": bucket["us"]["description"],
-                "mr_description": bucket["mr"]["description"],
-            }
-        )
+        case = {
+            "subject_id": subject_id,
+            "us_path": bucket["us"]["path"],
+            "mr_path": bucket["mr"]["path"],
+            "us_description": bucket["us"]["description"],
+            "mr_description": bucket["mr"]["description"],
+        }
+        if "preop_mr" in bucket:
+            case["preop_mr_path"] = bucket["preop_mr"]["path"]
+            case["preop_mr_description"] = bucket["preop_mr"]["description"]
+        cases.append(case)
     return cases
 
 
@@ -289,6 +296,7 @@ def preprocess_case(
     crop_padding: int,
     overwrite: bool,
     descriptions: Optional[Dict[str, str]] = None,
+    preop_mr_path: Optional[Path] = None,
 ) -> bool:
     case_dir = output_root / subject_id
     if case_dir.exists() and not overwrite:
@@ -298,12 +306,34 @@ def preprocess_case(
     print(f"[Load] {subject_id}")
     us_image = read_dicom_or_volume(us_path)
     mr_image = read_dicom_or_volume(mr_path)
+    preop_mr_image = None
+    if preop_mr_path is not None:
+        try:
+            preop_mr_image = read_dicom_or_volume(preop_mr_path)
+            print(f"[Load] {subject_id}: preop MR loaded from {preop_mr_path}")
+        except Exception as e:
+            print(f"[Warn] {subject_id}: failed to load preop MR: {e}")
+            preop_mr_image = None
+
     if us_image.GetDimension() != 3 or mr_image.GetDimension() != 3:
         print(f"[Skip] {subject_id}: only 3D volumes are supported.")
         return False
 
     print(f"[Register] {subject_id}")
     us_to_mr = rigid_register(mr_image, us_image)
+
+    preop_to_mr = None
+    if preop_mr_image is not None:
+        if preop_mr_image.GetDimension() == 3:
+            try:
+                preop_to_mr = rigid_register(mr_image, preop_mr_image)
+                print(f"[Register] {subject_id}: preop MR -> intraop MR done")
+            except Exception as e:
+                print(f"[Warn] {subject_id}: preop MR registration failed: {e}")
+                preop_to_mr = None
+        else:
+            print(f"[Warn] {subject_id}: preop MR is not 3D, skipping")
+            preop_mr_image = None
 
     spacing = out_spacing if out_spacing is not None else mr_image.GetSpacing()
     reference = make_reference_from_spacing(mr_image, spacing)
@@ -312,8 +342,18 @@ def preprocess_case(
     mr_resampled = resample_image(mr_image, reference, interpolator=sitk.sitkBSpline)
     us_resampled = resample_image(us_image, reference, transform=us_to_mr, interpolator=sitk.sitkBSpline)
 
+    preop_mr_resampled = None
+    if preop_mr_image is not None and preop_to_mr is not None:
+        preop_mr_resampled = resample_image(
+            preop_mr_image, reference, transform=preop_to_mr, interpolator=sitk.sitkBSpline
+        )
+
     us_array = sitk.GetArrayFromImage(us_resampled).astype(np.float32)
     mr_array = sitk.GetArrayFromImage(mr_resampled).astype(np.float32)
+    preop_mr_array = None
+    if preop_mr_resampled is not None:
+        preop_mr_array = sitk.GetArrayFromImage(preop_mr_resampled).astype(np.float32)
+
     us_mask = compute_us_mask(us_array)
     mr_mask = compute_mr_mask(mr_array)
     overlap_mask = compute_overlap_mask(us_mask, mr_mask)
@@ -324,6 +364,7 @@ def preprocess_case(
     mr_cropped = mr_array[bbox]
     overlap_cropped = overlap_mask[bbox]
     mr_mask_cropped = mr_mask[bbox]
+    preop_mr_cropped = preop_mr_array[bbox] if preop_mr_array is not None else None
 
     valid_slice_indices = compute_valid_slice_indices(overlap_cropped, mr_mask_cropped, min_overlap_ratio)
     if len(valid_slice_indices) < min_valid_slices:
@@ -333,11 +374,13 @@ def preprocess_case(
     print(f"[Normalize] {subject_id}")
     us_norm = normalize_us(us_cropped, lower_percentile, upper_percentile)
     mr_norm = normalize_mr(mr_cropped)
+    preop_mr_norm = normalize_mr(preop_mr_cropped) if preop_mr_cropped is not None else None
 
     meta = {
         "subject_id": subject_id,
         "us_path": str(us_path),
         "mr_path": str(mr_path),
+        "preop_mr_path": str(preop_mr_path) if preop_mr_path is not None else None,
         "us_shape_zyx": list(us_norm.shape),
         "mr_shape_zyx": list(mr_norm.shape),
         "spacing_xyz": [float(v) for v in spacing],
@@ -346,11 +389,17 @@ def preprocess_case(
         "min_overlap_ratio": min_overlap_ratio,
         "valid_slice_indices": valid_slice_indices,
         "valid_slice_count": len(valid_slice_indices),
+        "has_preop_mr": preop_mr_norm is not None,
     }
     if descriptions:
         meta.update(descriptions)
 
     save_case(output_root, subject_id, us_norm, mr_norm, overlap_cropped, meta)
+
+    if preop_mr_norm is not None:
+        np.save(case_dir / "preop_mr.npy", preop_mr_norm.astype(np.float32))
+        print(f"[Save] {subject_id}: preop_mr.npy saved (shape={preop_mr_norm.shape})")
+
     print(f"[Done] {subject_id} -> {case_dir}")
     return True
 
@@ -359,9 +408,10 @@ def write_manifest(output_root: Path, subject_ids: Sequence[str]) -> None:
     manifest_path = output_root / "preprocessed_pairs.csv"
     with open(manifest_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["subject_id", "us_path", "mr_path", "mask_path", "meta_path"])
+        writer.writerow(["subject_id", "us_path", "mr_path", "mask_path", "meta_path", "preop_mr_path"])
         for subject_id in subject_ids:
             case_dir = output_root / subject_id
+            preop_mr_path = str(case_dir / "preop_mr.npy") if (case_dir / "preop_mr.npy").exists() else ""
             writer.writerow(
                 [
                     subject_id,
@@ -369,6 +419,7 @@ def write_manifest(output_root: Path, subject_ids: Sequence[str]) -> None:
                     str(case_dir / "mr.npy"),
                     str(case_dir / "overlap_mask.npy"),
                     str(case_dir / "meta.json"),
+                    preop_mr_path,
                 ]
             )
 
@@ -387,12 +438,14 @@ def main() -> None:
         study_description=args.study_description,
         us_series=args.us_series,
         mr_series=args.mr_series,
+        preop_mr_series=args.preop_mr_series,
     )
     if not cases:
         raise RuntimeError("No valid intraoperative US/MR pairs were found for the requested series.")
 
     processed_subjects: List[str] = []
     for case in cases:
+        preop_mr_path = Path(case["preop_mr_path"]) if "preop_mr_path" in case else None
         saved = preprocess_case(
             subject_id=case["subject_id"],
             us_path=Path(case["us_path"]),
@@ -409,7 +462,9 @@ def main() -> None:
                 "study_description": args.study_description,
                 "us_description": case["us_description"],
                 "mr_description": case["mr_description"],
+                "preop_mr_description": case.get("preop_mr_description", ""),
             },
+            preop_mr_path=preop_mr_path,
         )
         if saved:
             processed_subjects.append(case["subject_id"])

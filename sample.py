@@ -19,6 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subject-id", type=str, default=None, help="Case identifier under preprocessed root.")
     parser.add_argument("--us-path", type=str, default=None, help="Direct path to preprocessed us.npy.")
     parser.add_argument("--mr-path", type=str, default=None, help="Optional path to preprocessed mr.npy for reference saving.")
+    parser.add_argument("--preop-mr-path", type=str, default=None, help="Path to preprocessed preop_mr.npy for structural prior.")
     parser.add_argument("--slice-index", type=int, required=True, help="Center slice index i used for [i-1, i, i+1].")
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--sampling", type=str, default="ddim", choices=["ddpm", "ddim"])
@@ -28,12 +29,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_case_paths(args: argparse.Namespace) -> Tuple[Path, Optional[Path], str]:
+def resolve_case_paths(args: argparse.Namespace) -> Tuple[Path, Optional[Path], Optional[Path], str]:
     if args.us_path is not None:
         us_path = Path(args.us_path).resolve()
         mr_path = Path(args.mr_path).resolve() if args.mr_path is not None else None
+        preop_mr_path = Path(args.preop_mr_path).resolve() if args.preop_mr_path is not None else None
         subject_id = args.subject_id or us_path.parent.name
-        return us_path, mr_path, subject_id
+        return us_path, mr_path, preop_mr_path, subject_id
 
     if args.preprocessed_root is None or args.subject_id is None:
         raise ValueError("Either provide --us-path or provide both --preprocessed-root and --subject-id.")
@@ -41,11 +43,14 @@ def resolve_case_paths(args: argparse.Namespace) -> Tuple[Path, Optional[Path], 
     case_dir = Path(args.preprocessed_root).resolve() / args.subject_id
     us_path = case_dir / "us.npy"
     mr_path = case_dir / "mr.npy"
+    preop_mr_path = case_dir / "preop_mr.npy"
     if not us_path.exists():
         raise FileNotFoundError(f"Missing US volume: {us_path}")
     if not mr_path.exists():
         mr_path = None
-    return us_path, mr_path, args.subject_id
+    if not preop_mr_path.exists():
+        preop_mr_path = None
+    return us_path, mr_path, preop_mr_path, args.subject_id
 
 
 def load_us_triplet(us_path: Path, slice_index: int, image_size: int) -> Tuple[torch.Tensor, int]:
@@ -73,6 +78,18 @@ def load_mr_reference(mr_path: Optional[Path], slice_index: int, image_size: int
     return mr_slice.squeeze(0).cpu().numpy()
 
 
+def load_preop_mr_slice(preop_mr_path: Optional[Path], slice_index: int, image_size: int) -> Optional[torch.Tensor]:
+    if preop_mr_path is None or not preop_mr_path.exists():
+        return None
+    preop_mr_volume = np.load(preop_mr_path).astype(np.float32)
+    if preop_mr_volume.ndim != 3:
+        return None
+    slice_index = max(0, min(slice_index, preop_mr_volume.shape[0] - 1))
+    preop_mr_slice = torch.from_numpy(preop_mr_volume[slice_index : slice_index + 1]).float()
+    preop_mr_slice = resize_tensor(preop_mr_slice, image_size)
+    return preop_mr_slice
+
+
 def build_model_from_checkpoint(checkpoint: dict, device: torch.device) -> DualDDPMCorrelationModel:
     model_config = checkpoint.get("model_config", {})
     model = DualDDPMCorrelationModel(
@@ -93,9 +110,13 @@ def main() -> None:
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    us_path, mr_path, subject_id = resolve_case_paths(args)
+    us_path, mr_path, preop_mr_path, subject_id = resolve_case_paths(args)
     us_input, slice_index = load_us_triplet(us_path, args.slice_index, args.image_size)
     us_input = us_input.to(device)
+
+    preop_mr_input = load_preop_mr_slice(preop_mr_path, slice_index, args.image_size)
+    if preop_mr_input is not None:
+        preop_mr_input = preop_mr_input.unsqueeze(0).to(device)
 
     checkpoint = torch.load(Path(args.checkpoint).resolve(), map_location=device)
     model = build_model_from_checkpoint(checkpoint, device)
@@ -106,6 +127,7 @@ def main() -> None:
             sampling=args.sampling,
             ddim_steps=args.ddim_steps,
             eta=args.eta,
+            preop_mr=preop_mr_input,
         )
 
     generated_np = generated.squeeze(0).squeeze(0).cpu().numpy().astype(np.float32)

@@ -101,11 +101,14 @@ def build_dataloaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]
 
 
 def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
-    return {
+    result = {
         "us": batch["us"].to(device, non_blocking=True),
         "mr": batch["mr"].to(device, non_blocking=True),
         "overlap_mask": batch["overlap_mask"].to(device, non_blocking=True),
     }
+    if "preop_mr" in batch:
+        result["preop_mr"] = batch["preop_mr"].to(device, non_blocking=True)
+    return result
 
 
 def reduce_metrics(running: Dict[str, float], losses: Dict[str, torch.Tensor], count: int) -> None:
@@ -181,6 +184,7 @@ def run_epoch(
         batch = move_batch_to_device(batch, device)
         us = batch["us"]
         mr = batch["mr"]
+        preop_mr = batch.get("preop_mr")
         batch_size = us.size(0)
 
         if train:
@@ -188,7 +192,7 @@ def run_epoch(
 
         with torch.set_grad_enabled(train):
             with autocast(enabled=device.type == "cuda"):
-                outputs = model.forward_train(us, mr)
+                outputs = model.forward_train(us, mr, preop_mr=preop_mr)
                 losses = criterion(
                     us_pred_noise=outputs["us"]["pred_noise"],
                     us_true_noise=outputs["us"]["noise"],

@@ -2,31 +2,35 @@
 
 基于 PyTorch 的脑肿瘤术中超声到术中 MRI 跨模态合成项目，当前任务设定固定为：
 
-- 输入：`USpreimri`
+- 输入：`USpreimri` + `3DAXT1postcontrast`（术前 MRI 结构先验）
 - 输出：`Intraop 2DAXT2BLADE`
 - 框架：`Dual DDPM + correlation loss`
 - 数据集：`ReMIND`
 
 ## 项目目标
 
-本项目面向 `ReMIND` 数据集中的术中场景，重点研究通过术中超声生成术中 MRI 的可行性。为降低目标域异质性，当前版本不混合多种术中 MRI 序列，而是只保留最稳定、样本量最大的目标序列 `2DAXT2BLADE`。
+本项目面向 `ReMIND` 数据集中的术中场景，重点研究通过术中超声和术前 MRI 生成术中 MRI 的可行性。术前 MRI 提供高质量解剖结构先验，术中超声提供实时手术视野，两者联合生成术中 MRI。
+
+为降低目标域异质性，当前版本不混合多种术中 MRI 序列，而是只保留最稳定、样本量最大的目标序列 `2DAXT2BLADE`。
 
 ## 当前实现
 
 - `preprocess_remind.py`
-  - 从 `metadata.csv` 自动筛选 `USpreimri -> Intraop 2DAXT2BLADE`
-  - 以 MRI 为空间参考
-  - 对 US 做刚性配准并重采样到 MRI 网格
+  - 从 `metadata.csv` 自动筛选 `USpreimri -> Intraop 2DAXT2BLADE` + 术前 `3DAXT1postcontrast`
+  - 以术中 MRI 为空间参考
+  - 对 US 和术前 MRI 分别做刚性配准并重采样到术中 MRI 网格
   - 裁剪重叠 ROI
-  - 输出 `us.npy`、`mr.npy`、`overlap_mask.npy`、`meta.json`
+  - 输出 `us.npy`、`mr.npy`、`preop_mr.npy`、`overlap_mask.npy`、`meta.json`
 - `dataset.py`
   - 读取预处理后的 3D 体数据
   - 进行 2.5D 切片采样
   - 只优先抽取有足够重叠的有效切片
+  - 返回 US、MR、术前 MR 和 overlap mask
 - `model.py`
   - 实现双 DDPM 结构
-  - `DDPM_US` 负责源域自编码去噪
-  - `DDPM_MR` 负责目标 MRI 条件生成
+  - `DDPM_US` 负责源域自编码去噪（3ch 输入/输出）
+  - `DDPM_MR` 负责目标 MRI 条件生成（5ch 输入 = noisy MR + US + preop MR，1ch 输出）
+  - 术前 MRI 作为额外条件通道拼接到 MR UNet 输入
 - `loss.py`
   - 实现去噪损失
   - 实现基于皮尔逊相关系数的跨模态相关性损失
@@ -34,8 +38,10 @@
 - `train.py`
   - 联合训练双 DDPM
   - 使用 `AdamW`
+  - 支持术前 MRI 条件输入
 - `sample.py`
   - 支持基于训练好的模型进行条件采样
+  - 支持术前 MRI 作为结构先验
 
 ## 推荐目录
 
@@ -83,6 +89,7 @@ pip install torch numpy SimpleITK
 - `Study Description = Intraop`
 - `US Series = USpreimri`
 - `MR Series = 2DAXT2BLADE`
+- `Preop MR Series = 3DAXT1postcontrast`
 
 ## 预处理
 
@@ -100,6 +107,7 @@ python preprocess_remind.py ^
 
 - `us.npy`
 - `mr.npy`
+- `preop_mr.npy`
 - `overlap_mask.npy`
 - `meta.json`
 - `preprocessed_pairs.csv`
@@ -122,6 +130,7 @@ python train.py ^
 - 按病例划分训练集和验证集
 - 对 US 和 MRI 做联合扩散训练
 - 将相关性约束限制在有效重叠区域
+- 术前 MRI 作为额外条件通道参与 MR 生成
 
 ## 采样
 
@@ -138,11 +147,29 @@ python sample.py ^
   --output-dir "c:\Users\小小祁\Desktop\北工大医院项目\超声术中生成——分类整理后\samples"
 ```
 
+## 模型架构
+
+```
+DDPM_US (自编码去噪)          DDPM_MR (条件生成)
+┌──────────────┐              ┌──────────────┐
+│ US (3ch)     │              │ Noisy MR(1ch)│
+│   ↓          │              │ US cond(3ch) │
+│ UNet Encoder │──features──→ │ Preop MR(1ch)│
+│   ↓          │              │   ↓          │
+│ UNet Decoder │              │ UNet Encoder │
+│   ↓          │              │   + fusion   │
+│ US recon(3ch)│              │   ↓          │
+└──────────────┘              │ UNet Decoder │
+                              │   ↓          │
+                              │ MR pred(1ch) │
+                              └──────────────┘
+```
+
 ## 当前实验建议
 
 针对当前数据集，推荐优先采用以下实验路线：
 
-1. 固定任务为 `USpreimri -> Intraop 2DAXT2BLADE`
+1. 固定任务为 `USpreimri + Preop 3DAXT1postcontrast -> Intraop 2DAXT2BLADE`
 2. 先检查预处理后的配准与重叠区域是否合理
 3. 再训练当前 DDIC 版本
 4. 后续可增加 `UNet baseline` 作为对照实验

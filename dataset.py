@@ -23,6 +23,7 @@ def load_pairs_from_manifest(manifest_path: Path) -> List[Dict[str, str]]:
                     "mr_path": row["mr_path"],
                     "mask_path": row.get("mask_path", ""),
                     "meta_path": row.get("meta_path", ""),
+                    "preop_mr_path": row.get("preop_mr_path", ""),
                 }
             )
     return pairs
@@ -40,6 +41,7 @@ def discover_pairs(preprocessed_root: Path) -> List[Dict[str, str]]:
         us_path = case_dir / "us.npy"
         mr_path = case_dir / "mr.npy"
         if us_path.exists() and mr_path.exists():
+            preop_mr_path = str(case_dir / "preop_mr.npy") if (case_dir / "preop_mr.npy").exists() else ""
             pairs.append(
                 {
                     "subject_id": case_dir.name,
@@ -47,6 +49,7 @@ def discover_pairs(preprocessed_root: Path) -> List[Dict[str, str]]:
                     "mr_path": str(mr_path),
                     "mask_path": str(case_dir / "overlap_mask.npy") if (case_dir / "overlap_mask.npy").exists() else "",
                     "meta_path": str(case_dir / "meta.json") if (case_dir / "meta.json").exists() else "",
+                    "preop_mr_path": preop_mr_path,
                 }
             )
     if not pairs:
@@ -104,6 +107,7 @@ class RemindSliceDataset(Dataset):
         self.us_volumes: List[np.ndarray] = []
         self.mr_volumes: List[np.ndarray] = []
         self.mask_volumes: List[np.ndarray] = []
+        self.preop_mr_volumes: List[Optional[np.ndarray]] = []
         self.valid_indices: List[List[int]] = []
         for case in self.cases:
             us = np.load(case["us_path"]).astype(np.float32)
@@ -122,6 +126,15 @@ class RemindSliceDataset(Dataset):
             self.us_volumes.append(us)
             self.mr_volumes.append(mr)
             self.mask_volumes.append(overlap_mask)
+
+            preop_mr_path = case.get("preop_mr_path", "")
+            if preop_mr_path and Path(preop_mr_path).exists():
+                preop_mr = np.load(preop_mr_path).astype(np.float32)
+                if preop_mr.shape != us.shape:
+                    raise ValueError(f"Preop MR shape mismatch for {case['subject_id']}: {preop_mr.shape} vs {us.shape}")
+                self.preop_mr_volumes.append(preop_mr)
+            else:
+                self.preop_mr_volumes.append(None)
 
             valid_indices = []
             if meta_path and Path(meta_path).exists():
@@ -174,14 +187,21 @@ class RemindSliceDataset(Dataset):
         us_volume = self.us_volumes[case_idx]
         mr_volume = self.mr_volumes[case_idx]
         mask_volume = self.mask_volumes[case_idx]
+        preop_mr_volume = self.preop_mr_volumes[case_idx]
 
         us_slice = torch.from_numpy(us_volume[slice_idx - 1 : slice_idx + 2]).float()
         mr_slice = torch.from_numpy(mr_volume[slice_idx : slice_idx + 1]).float()
         overlap_mask = torch.from_numpy(mask_volume[slice_idx : slice_idx + 1]).float()
 
+        if preop_mr_volume is not None:
+            preop_mr_slice = torch.from_numpy(preop_mr_volume[slice_idx : slice_idx + 1]).float()
+        else:
+            preop_mr_slice = torch.zeros_like(mr_slice)
+
         us_slice = resize_tensor(us_slice, self.image_size)
         mr_slice = resize_tensor(mr_slice, self.image_size)
         overlap_mask = resize_tensor(overlap_mask, self.image_size)
+        preop_mr_slice = resize_tensor(preop_mr_slice, self.image_size)
         overlap_mask = (overlap_mask > 0.5).float()
         us_slice, mr_slice, overlap_mask = self._augment(us_slice, mr_slice, overlap_mask)
 
@@ -191,4 +211,5 @@ class RemindSliceDataset(Dataset):
             "us": us_slice.contiguous(),
             "mr": mr_slice.contiguous(),
             "overlap_mask": overlap_mask.contiguous(),
+            "preop_mr": preop_mr_slice.contiguous(),
         }
